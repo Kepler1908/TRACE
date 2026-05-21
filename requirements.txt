@@ -1,0 +1,24 @@
+# LLM Integration
+anthropic>=0.77.0
+openai>=2.16.0
+google-generativeai>=0.8.0
+
+# Data & Schema Validation
+pydantic>=2.12.0
+pydantic-settings>=2.12.0
+
+# Configuration & Environment
+python-dotenv>=1.2.0
+
+# Async & Retry
+tenacity>=9.1.0
+
+# Logging
+structlog>=25.5.0
+
+# Numerical
+numpy>=2.4.0
+
+# Embeddings (for build_embeddings and cosine search)
+sentence-transformers>=5.2.0
+torch>=2.10.0
