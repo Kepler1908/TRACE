@@ -19,9 +19,9 @@ cp .env.example .env
 Edit `.env` to set your provider and API key:
 
 ```bash
-DEFAULT_LLM_PROVIDER=deepseek        # openai, anthropic, google, deepseek, openrouter, llama_cpp, vllm, sglang
-DEFAULT_LLM_MODEL=deepseek-chat
-DEEPSEEK_API_KEY=sk-...
+DEFAULT_LLM_PROVIDER=openrouter        # openai, anthropic, google, deepseek, openrouter, llama_cpp, vllm, sglang
+DEFAULT_LLM_MODEL=deepseek/deepseek-v4-flash
+DEEPSEEK_API_KEY=
 ```
 
 For local models (llama.cpp / vLLM / SGLang), set the base URL:
@@ -193,7 +193,7 @@ Default paths point to `data/rag_corpus/histoQA_thirdrepublic/`. Override them b
 ## Project Structure
 
 ```
-trace_rag/
+TRACE/
   src/
     cli.py          # CLI entry point
     pipeline.py     # Orchestrates the 4-phase pipeline
