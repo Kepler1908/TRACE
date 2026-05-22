@@ -242,7 +242,7 @@ class LLMClient:
         temperature = temperature if temperature is not None else self.settings.temperature
         max_tokens = max_tokens or self.settings.max_tokens
 
-        logger.debug(
+        logger.info(
             "Sending LLM request",
             model=model_name,
             provider=provider,
@@ -366,7 +366,7 @@ class LLMClient:
             "total_tokens": response.usage.total_tokens if response.usage else 0,
         }
 
-        logger.debug(
+        logger.info(
             "LLM chat response received",
             model=model_name,
             tokens=usage["total_tokens"],
@@ -423,7 +423,7 @@ class LLMClient:
             "total_tokens": response.usage.total_tokens if response.usage else 0,
         }
 
-        logger.debug(
+        logger.info(
             "LLM response received",
             model=model_name,
             tokens=usage["total_tokens"],
@@ -482,7 +482,7 @@ class LLMClient:
             ),
         }
 
-        logger.debug(
+        logger.info(
             "LLM response received",
             model=model_name,
             tokens=usage["total_tokens"],
@@ -544,7 +544,7 @@ class LLMClient:
             "total_tokens": getattr(usage_meta, "total_token_count", 0) if usage_meta else 0,
         }
 
-        logger.debug(
+        logger.info(
             "LLM response received",
             model=model_name,
             tokens=usage["total_tokens"],
