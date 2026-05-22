@@ -186,7 +186,7 @@ LLM output (especially from smaller or local models) can be unstable. The agent 
 
 ### Data Paths (`src/types.py`)
 
-Default paths point to `data/rag_corpus/histoQA_thirdrepublic/`. Override them by passing explicit paths to `build_full_corpus()` and `load_questions_jsonl()`, or modify the constants directly.
+Default paths point to `data/corpus/`. Override them by passing explicit paths to `build_full_corpus()` and `load_questions_jsonl()`, or modify the constants in `src/types.py`.
 
 ---
 
