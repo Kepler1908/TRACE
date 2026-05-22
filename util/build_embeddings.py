@@ -7,10 +7,10 @@ each chunk back to its source doc_id, enabling max-pooling per document at
 search time.
 
 Usage:
-    python -m trace_rag.util.build_embeddings
-    python -m trace_rag.util.build_embeddings --model Qwen/Qwen3-Embedding-8B
-    python -m trace_rag.util.build_embeddings --chunk-tokens 512
-    python -m trace_rag.util.build_embeddings --resume
+    python -m TRACE.util.build_embeddings
+    python -m TRACE.util.build_embeddings --model Qwen/Qwen3-Embedding-8B
+    python -m TRACE.util.build_embeddings --chunk-tokens 512
+    python -m TRACE.util.build_embeddings --resume
 """
 
 from __future__ import annotations

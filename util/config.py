@@ -1,5 +1,5 @@
 """
-Configuration management for trace_rag.
+Configuration management for TRACE.
 
 Pydantic Settings with env variable support for LLM providers, logging, and application settings.
 """

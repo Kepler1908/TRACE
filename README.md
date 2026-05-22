@@ -1,4 +1,4 @@
-# trace_rag
+# TRACE
 
 Agentic RAG retrieval pipeline with planner decomposition, multi-tool search, deferred relevance judgment, and LLM-based reranking.
 
@@ -60,7 +60,7 @@ Place these files in `data/corpus/` (default path), or pass custom paths via `bu
 ### 4. Build Embeddings (optional, for dense search channel)
 
 ```bash
-python -m trace_rag.util.build_embeddings
+python -m TRACE.util.build_embeddings
 ```
 
 This pre-computes embeddings and saves `embeddings_cache.npy` + `embeddings_doc_ids.json` in the corpus directory. Without this step, the pipeline still works using BM25 + date + grep channels.
@@ -68,7 +68,7 @@ This pre-computes embeddings and saves `embeddings_cache.npy` + `embeddings_doc_
 ### 5. Run
 
 ```bash
-python -m trace_rag --limit 5 --seed 42
+python -m TRACE --limit 5 --seed 42
 ```
 
 Key flags:

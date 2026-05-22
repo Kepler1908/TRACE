@@ -1,3 +1,3 @@
-from trace_rag.src.cli import main
+from .src.cli import main
 
 main()

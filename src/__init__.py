@@ -1,4 +1,4 @@
-# trace_rag/src/__init__.py
+# TRACE/src/__init__.py
 from .types import (
     RetrievalState,
     SubQuestionResult,

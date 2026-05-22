@@ -1,1 +1,1 @@
-"""trace_rag — Training-free Retrieval with Agentic Corpus Exploration."""
+"""TRACE — Training-free Retrieval with Agentic Corpus Exploration."""

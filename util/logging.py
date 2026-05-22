@@ -1,5 +1,5 @@
 """
-Structured logging configuration for trace_rag.
+Structured logging configuration for TRACE.
 
 Uses structlog for structured, context-aware logging with console and JSON output formats.
 """
