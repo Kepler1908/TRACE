@@ -1,9 +1,16 @@
 """
 BM25 tool: term-frequency ranking with IDF weighting.
 
-Custom BM25 implementation using tokenize_for_index() from the storage
-utilities. Supports chunk-based indexing where multiple chunks share the
-same parent doc_id — returns the best chunk score per document (max-pooling).
+Two-tier implementation:
+1. If ``bm25s`` is installed AND ``USE_BM25S`` is enabled, scoring goes
+   through the C-backed sparse-matrix library (~100× faster on large
+   corpora; same Okapi BM25 formula).
+2. Otherwise a custom implementation runs with a postings-list inverted
+   index (df-keyed), so query cost scales with ``|query_terms| · df`` not
+   with the full corpus size.
+
+Both tiers are chunk-aware: ``chunk_to_parent`` maps chunk keys to parent
+doc_ids and ``tool_bm25`` max-pools scores per parent.
 """
 
 from __future__ import annotations
@@ -31,9 +38,10 @@ def _snippet(doc: CorpusDoc, length: int = 150) -> str:
 class BM25Index:
     """Precomputed BM25 index over a (possibly chunked) corpus.
 
-    When built from a chunked corpus, ``chunk_to_parent`` maps each internal
-    chunk key to its parent doc_id.  ``tool_bm25`` max-pools scores per
-    parent so callers always receive parent doc_ids.
+    ``postings`` is the inverted index used by the custom scorer:
+    term -> list[(chunk_key, tf)]. ``bm25s_obj`` holds an optional
+    ``bm25s.BM25`` instance (with parallel ``bm25s_corpus_keys`` listing
+    the chunk_key per row) used when the library is available.
     """
 
     doc_ids: list[str]
@@ -42,6 +50,9 @@ class BM25Index:
     doc_len: dict[str, int]       # key -> token count
     avgdl: float
     chunk_to_parent: dict[str, str] = field(default_factory=dict)
+    postings: dict[str, list[tuple[str, int]]] = field(default_factory=dict)
+    bm25s_obj: object | None = None
+    bm25s_corpus_keys: list[str] = field(default_factory=list)
     k1: float = 1.5
     b: float = 0.75
 
@@ -58,6 +69,7 @@ def build_bm25(docs: dict[str, CorpusDoc]) -> BM25Index:
     df: defaultdict[str, int] = defaultdict(int)
     doc_len: dict[str, int] = {}
     chunk_to_parent: dict[str, str] = {}
+    postings: dict[str, list[tuple[str, int]]] = defaultdict(list)
 
     for key, doc in docs.items():
         doc_ids.append(key)
@@ -66,14 +78,41 @@ def build_bm25(docs: dict[str, CorpusDoc]) -> BM25Index:
         counts = Counter(tokens)
         tf[key] = counts
         doc_len[key] = len(tokens)
-        for term in counts:
+        for term, count in counts.items():
             df[term] += 1
+            postings[term].append((key, count))
 
     total = sum(doc_len.values())
     avgdl = total / len(doc_len) if doc_len else 0.0
+
+    bm25s_obj = None
+    bm25s_corpus_keys: list[str] = []
+    try:
+        from ..types import USE_BM25S
+    except Exception:
+        USE_BM25S = False  # type: ignore[assignment]
+
+    if USE_BM25S:
+        try:
+            import bm25s  # type: ignore
+
+            corpus_tokens = [list(tf[k].elements()) for k in doc_ids]
+            retriever = bm25s.BM25(k1=1.5, b=0.75)
+            retriever.index(corpus_tokens)
+            bm25s_obj = retriever
+            bm25s_corpus_keys = list(doc_ids)
+        except Exception:
+            # bm25s missing or failed at index time — silently fall back
+            # to the postings-list scorer. The custom path is still correct.
+            bm25s_obj = None
+            bm25s_corpus_keys = []
+
     return BM25Index(
         doc_ids=doc_ids, tf=tf, df=dict(df), doc_len=doc_len, avgdl=avgdl,
         chunk_to_parent=chunk_to_parent,
+        postings=dict(postings),
+        bm25s_obj=bm25s_obj,
+        bm25s_corpus_keys=bm25s_corpus_keys,
     )
 
 
@@ -98,6 +137,77 @@ def _bm25_score(query_tokens: list[str], idx: BM25Index, doc_id: str) -> float:
     return score
 
 
+def _score_via_postings(
+    q_tokens: list[str],
+    index: BM25Index,
+    scope_set: set[str] | None,
+) -> dict[str, float]:
+    """Score using the postings inverted index.
+
+    Only documents that contain at least one query term are visited — O(sum
+    of df) instead of O(N corpus). For each candidate, we apply the full
+    Okapi BM25 formula on the union of query terms it actually contains.
+    """
+    if not q_tokens or index.avgdl <= 0.0:
+        return {}
+    N = len(index.doc_ids)
+    k1, b = index.k1, index.b
+
+    candidate_terms: dict[str, list[tuple[str, int, float]]] = {}
+    for term in set(q_tokens):
+        df = index.df.get(term, 0)
+        if df == 0:
+            continue
+        idf = math.log((N - df + 0.5) / (df + 0.5) + 1.0)
+        for key, freq in index.postings.get(term, ()):
+            if scope_set is not None and key not in scope_set:
+                continue
+            candidate_terms.setdefault(key, []).append((term, freq, idf))
+
+    scores: dict[str, float] = {}
+    for key, entries in candidate_terms.items():
+        dl = index.doc_len.get(key, 0)
+        norm = k1 * (1.0 - b + b * dl / index.avgdl)
+        s = 0.0
+        for _term, freq, idf in entries:
+            s += idf * (freq * (k1 + 1.0)) / (freq + norm)
+        if s > 0.0:
+            scores[key] = s
+    return scores
+
+
+def _score_via_bm25s(
+    q_tokens: list[str],
+    index: BM25Index,
+    scope_set: set[str] | None,
+    k_pool: int,
+) -> dict[str, float]:
+    if index.bm25s_obj is None or not q_tokens:
+        return {}
+    try:
+        import numpy as np
+
+        topn = min(k_pool, len(index.bm25s_corpus_keys))
+        # bm25s expects a tokenised query (list of strings).
+        ranked_idx, ranked_scores = index.bm25s_obj.retrieve(
+            [q_tokens], k=topn, return_as="tuple",
+        )
+        ids = np.asarray(ranked_idx[0])
+        scores = np.asarray(ranked_scores[0])
+    except Exception:
+        return {}
+
+    out: dict[str, float] = {}
+    for idx, score in zip(ids.tolist(), scores.tolist()):
+        if score <= 0:
+            continue
+        key = index.bm25s_corpus_keys[int(idx)]
+        if scope_set is not None and key not in scope_set:
+            continue
+        out[key] = float(score)
+    return out
+
+
 def tool_bm25(
     query: str,
     index: BM25Index,
@@ -105,34 +215,31 @@ def tool_bm25(
     max_results: int = 10,
     candidate_ids: list[str] | None = None,
 ) -> list[SearchHit]:
-    """
-    BM25 keyword search over the corpus (chunk-aware, max-pooled).
-
-    Scores each chunk independently and returns the best score per parent
-    doc_id. When ``candidate_ids`` are provided, they are parent doc_ids —
-    all chunks belonging to those parents are searched.
-
-    Returns:
-        Sorted list of SearchHit with parent doc_ids (highest BM25 first).
-    """
     from ..types import SearchHit
 
     q_tokens = tokenize_for_index(query)
+    if not q_tokens:
+        return []
 
     if candidate_ids:
-        # Expand parent IDs to chunk keys
         parent_set = set(candidate_ids)
-        scope = [k for k in index.doc_ids
-                 if index.chunk_to_parent.get(k, k) in parent_set]
+        scope_set: set[str] | None = {
+            k for k in index.doc_ids
+            if index.chunk_to_parent.get(k, k) in parent_set
+        }
     else:
-        scope = index.doc_ids
+        scope_set = None
 
-    # Score chunks, max-pool per parent doc_id, track best chunk_key
-    doc_best: dict[str, tuple[float, str]] = {}  # parent → (score, chunk_key)
-    for key in scope:
-        s = _bm25_score(q_tokens, index, key)
-        if s <= 0:
-            continue
+    # Try bm25s first (faster on big corpora). Over-fetch so post-filter
+    # and per-parent max-pool still yield ``max_results`` parent docs.
+    k_pool = max(max_results * 6, 200)
+    chunk_scores = _score_via_bm25s(q_tokens, index, scope_set, k_pool)
+    if not chunk_scores:
+        chunk_scores = _score_via_postings(q_tokens, index, scope_set)
+
+    # Max-pool per parent doc_id, track best chunk_key
+    doc_best: dict[str, tuple[float, str]] = {}
+    for key, s in chunk_scores.items():
         parent = index.chunk_to_parent.get(key, key)
         if s > doc_best.get(parent, (-1.0, ""))[0]:
             doc_best[parent] = (s, key)
