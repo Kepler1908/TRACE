@@ -12,8 +12,30 @@ from typing import Any
 from .types import (
     CorpusDoc, MetadataEntry, QuestionEntry,
     CORPUS_JSONL, QUESTION_JSONL, CORPUS_DIR,
-    CHUNK_MAX_TOKENS,
+    CHUNK_MAX_TOKENS, CHUNK_OVERLAP_RATIO,
 )
+
+# Optional real tokenizer — fall back to whitespace if tiktoken not installed.
+try:
+    import tiktoken
+    _TIKTOKEN_ENC = tiktoken.get_encoding("cl100k_base")
+except Exception:  # ImportError or runtime model fetch failure
+    _TIKTOKEN_ENC = None
+
+
+def _count_tokens(text: str) -> int:
+    """Token count for chunking budget.
+
+    Uses cl100k_base when tiktoken is available (close to BPE behaviour of
+    most modern encoders, including the SentenceTransformer models we
+    typically use); falls back to whitespace word count otherwise.
+    """
+    if _TIKTOKEN_ENC is not None:
+        try:
+            return len(_TIKTOKEN_ENC.encode(text, disallowed_special=()))
+        except Exception:
+            pass
+    return len(text.split())
 
 # ---------------------------------------------------------------------------
 # JSONL loading
@@ -99,38 +121,75 @@ def build_full_corpus(
 _SENT_RE = re.compile(r"(?<=[.!?…»\"])\s+")
 
 
-def _chunk_text_by_sentences(text: str, max_tokens: int = CHUNK_MAX_TOKENS) -> list[str]:
-    """Split text into chunks of ~max_tokens words preserving sentence boundaries.
+def _chunk_text_by_sentences(
+    text: str,
+    max_tokens: int = CHUNK_MAX_TOKENS,
+    overlap_ratio: float = CHUNK_OVERLAP_RATIO,
+) -> list[str]:
+    """Split text into chunks of ~max_tokens preserving sentence boundaries.
 
-    Uses whitespace word count as a token proxy (no model tokenizer needed).
+    Uses ``_count_tokens`` (tiktoken when available, whitespace otherwise) so
+    chunk sizes correlate with what the embedding model actually sees,
+    instead of the prior raw word count which over-shot on CJK/inflected
+    text.
+
+    A trailing tail of size ``max_tokens * overlap_ratio`` is carried into
+    the next chunk so a proper noun cut at a chunk boundary remains visible
+    in both sides.
     """
     sentences = _SENT_RE.split(text.strip())
     if not sentences:
         return [text.strip()] if text.strip() else []
 
+    overlap_budget = max(0, int(max_tokens * max(0.0, overlap_ratio)))
     chunks: list[str] = []
     current: list[str] = []
-    current_words = 0
+    current_tokens = 0
+    current_sent_tokens: list[int] = []
+
+    def _flush_with_overlap() -> None:
+        nonlocal current, current_tokens, current_sent_tokens
+        if not current:
+            return
+        chunks.append(" ".join(current))
+        if overlap_budget <= 0:
+            current, current_tokens, current_sent_tokens = [], 0, []
+            return
+        # Carry trailing sentences whose tokens fit the overlap budget.
+        carry_sents: list[str] = []
+        carry_tokens: list[int] = []
+        running = 0
+        for sent, tok in zip(reversed(current), reversed(current_sent_tokens)):
+            if running + tok > overlap_budget and carry_sents:
+                break
+            carry_sents.append(sent)
+            carry_tokens.append(tok)
+            running += tok
+            if running >= overlap_budget:
+                break
+        current = list(reversed(carry_sents))
+        current_sent_tokens = list(reversed(carry_tokens))
+        current_tokens = sum(current_sent_tokens)
 
     for sent in sentences:
         sent = sent.strip()
         if not sent:
             continue
-        sent_words = len(sent.split())
+        sent_tokens = _count_tokens(sent)
 
-        if sent_words >= max_tokens:
+        if sent_tokens >= max_tokens:
             if current:
                 chunks.append(" ".join(current))
-                current, current_words = [], 0
+                current, current_tokens, current_sent_tokens = [], 0, []
             chunks.append(sent)
             continue
 
-        if current_words + sent_words > max_tokens and current:
-            chunks.append(" ".join(current))
-            current, current_words = [], 0
+        if current_tokens + sent_tokens > max_tokens and current:
+            _flush_with_overlap()
 
         current.append(sent)
-        current_words += sent_words
+        current_sent_tokens.append(sent_tokens)
+        current_tokens += sent_tokens
 
     if current:
         chunks.append(" ".join(current))
@@ -152,9 +211,9 @@ def build_chunked_corpus(
     chunked: dict[str, CorpusDoc] = {}
     for doc_id, doc in full_docs.items():
         text = doc.text_original or doc.contents_text or ""
-        word_count = len(text.split())
+        token_count = _count_tokens(text)
 
-        if word_count <= max_tokens:
+        if token_count <= max_tokens:
             chunked[doc_id] = doc
             continue
 
