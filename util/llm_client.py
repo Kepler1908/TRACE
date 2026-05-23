@@ -437,6 +437,11 @@ class LLMClient:
             raw_response=response,
         )
 
+    # Threshold (chars) above which it's worth spending a cache_control marker.
+    # Anthropic charges a small write-cost for cached prefixes, so we only mark
+    # system prompts that are large enough to repay it within ~2 reuses.
+    _ANTHROPIC_CACHE_MIN_CHARS = 1024
+
     async def _complete_anthropic(
         self,
         prompt: str,
@@ -446,11 +451,21 @@ class LLMClient:
         max_tokens: int,
         json_mode: bool,
     ) -> LLMResponse:
-        """Handle completion for Anthropic provider."""
+        """Handle completion for Anthropic provider with prompt caching.
+
+        The agent and rerank loops re-issue the same ~2 KB ``AGENT_SYSTEM`` /
+        ``RERANK_SYSTEM`` block dozens of times per question. Marking it as
+        an ephemeral cache breakpoint cuts the prompt-token spend on every
+        cache hit by ~90%.
+        """
         if not self._anthropic_client:
             raise RuntimeError(
                 "Anthropic API key not configured. Set ANTHROPIC_API_KEY environment variable."
             )
+
+        # Import here to keep the module import-light when only feature flags
+        # are read at startup, and to localise any future settings access.
+        from ..src.types import USE_ANTHROPIC_PROMPT_CACHING
 
         effective_system = system or ""
         if json_mode and "JSON" not in effective_system.upper():
@@ -458,9 +473,24 @@ class LLMClient:
                 effective_system + "\n\nRespond with valid JSON only, no additional text."
             ).strip()
 
+        if (
+            USE_ANTHROPIC_PROMPT_CACHING
+            and effective_system
+            and len(effective_system) >= self._ANTHROPIC_CACHE_MIN_CHARS
+        ):
+            system_arg: Any = [
+                {
+                    "type": "text",
+                    "text": effective_system,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ]
+        else:
+            system_arg = effective_system if effective_system else "You are a helpful assistant."
+
         response = await self._anthropic_client.messages.create(
             model=model_name,
-            system=effective_system if effective_system else "You are a helpful assistant.",
+            system=system_arg,
             messages=[{"role": "user", "content": prompt}],
             temperature=temperature,
             max_tokens=max_tokens,
@@ -472,20 +502,26 @@ class LLMClient:
                 if hasattr(block, "text"):
                     content = block.text
                     break
+
+        u = response.usage
+        cache_read = int(getattr(u, "cache_read_input_tokens", 0) or 0) if u else 0
+        cache_create = int(getattr(u, "cache_creation_input_tokens", 0) or 0) if u else 0
+        input_tokens = int(u.input_tokens) if u else 0
+        output_tokens = int(u.output_tokens) if u else 0
         usage = {
-            "prompt_tokens": response.usage.input_tokens if response.usage else 0,
-            "completion_tokens": response.usage.output_tokens if response.usage else 0,
-            "total_tokens": (
-                (response.usage.input_tokens + response.usage.output_tokens)
-                if response.usage
-                else 0
-            ),
+            "prompt_tokens": input_tokens + cache_read + cache_create,
+            "completion_tokens": output_tokens,
+            "total_tokens": input_tokens + cache_read + cache_create + output_tokens,
+            "cache_read_tokens": cache_read,
+            "cache_creation_tokens": cache_create,
         }
 
         logger.info(
             "LLM response received",
             model=model_name,
             tokens=usage["total_tokens"],
+            cache_read=cache_read,
+            cache_create=cache_create,
         )
 
         return LLMResponse(
