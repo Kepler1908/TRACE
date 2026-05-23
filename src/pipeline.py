@@ -7,15 +7,23 @@ from typing import Any
 
 from ..util.llm_client import LLMClient, TokenTracker
 from ..util.config import get_settings
+from ..util.logging import get_logger
 
-from .types import SubQuestionResult, RetrievalState, RetrievalResult, AcceptedDoc
+from .types import (
+    SubQuestionResult, RetrievalState, RetrievalResult, AcceptedDoc,
+    LLMParseError, LLMSchemaError, PLANNER_VALIDATION_RETRIES,
+)
 from . import types as types_mod
 from . import prompts
 from . import tools
 from . import agent
+from .reranker import cross_encoder_available, rerank_with_cross_encoder
+from .schemas import PlannerOutput, ReplanOutput, validate_planner, validate_replan
 from typing import Callable, Awaitable
 
 ReviewCallback = Callable[[str, dict[str, Any]], Awaitable[dict[str, Any]]]
+
+logger = get_logger(__name__)
 
 
 async def _no_review(_review_type: str, data: dict[str, Any]) -> dict[str, Any]:
@@ -27,6 +35,13 @@ async def run_planner(
     max_subq: int = types_mod.MAX_SUB_QUESTIONS,
     quiet: bool = False,
 ) -> dict[str, Any]:
+    """Run the query planner with parse + schema retries.
+
+    Retries up to ``PLANNER_VALIDATION_RETRIES`` extra times, each time
+    feeding the previous parse/schema error back to the model so it can
+    self-correct. Falls back to a single-sub-question plan on persistent
+    failure and logs a WARNING so the incident is visible.
+    """
     client = LLMClient(get_settings().llm)
     system = (prompts.PLANNER_SYSTEM
               .replace("{max_subq}", str(max_subq))
@@ -34,25 +49,48 @@ async def run_planner(
               .replace("{corpora}", prompts.CORPORA_STR)
               .replace("{corpus_description}", prompts.CORPUS_DESCRIPTION))
     prompt = f"Question: {entry.question}"
-    response = await client.complete(
-        prompt, system=system, json_mode=True,
-        max_tokens=types_mod.PLANNER_MAX_TOKENS,
-    )
-    tracker.record(response.usage)
-    try:
-        parsed = tools.parse_json_object(response.content)
-    except ValueError:
-        parsed = {}
-    parsed.setdefault("query_analysis", "")
-    parsed.setdefault("sub_questions", [])
-    parsed.setdefault("entities_to_find", [])
-    parsed.setdefault("dates_mentioned", [])
-    if len(parsed["sub_questions"]) > max_subq:
-        parsed["sub_questions"] = parsed["sub_questions"][:max_subq]
+    last_error: str | None = None
+
+    for attempt in range(PLANNER_VALIDATION_RETRIES + 1):
+        attempt_prompt = prompt
+        if last_error:
+            attempt_prompt = (
+                f"{prompt}\n\nPrevious attempt failed validation: {last_error}. "
+                "Return strictly the schema. JSON only."
+            )
+        response = await client.complete(
+            attempt_prompt, system=system, json_mode=True,
+            max_tokens=types_mod.PLANNER_MAX_TOKENS,
+        )
+        tracker.record(response.usage)
+        try:
+            raw = tools.parse_json_object(response.content)
+            validated = validate_planner(raw)
+            break
+        except (LLMParseError, LLMSchemaError) as exc:
+            last_error = str(exc)[:200]
+            logger.warning(
+                "planner.invalid_response",
+                attempt=attempt + 1,
+                error=last_error,
+            )
+    else:
+        logger.error("planner.giveup", question_id=entry.question_id)
+        validated = PlannerOutput(
+            query_analysis="",
+            sub_questions=[],
+        )
+
+    sub_questions = [sq.model_dump() for sq in validated.sub_questions[:max_subq]]
+    parsed = {
+        "query_analysis": validated.query_analysis,
+        "sub_questions": sub_questions,
+        "entities_to_find": validated.entities_to_find,
+        "dates_mentioned": validated.dates_mentioned,
+    }
     if not quiet:
-        n_sq = len(parsed["sub_questions"])
-        print(f"  [Planner] sub_questions={n_sq}")
-        print(f"  [Planner] analysis: {parsed.get('query_analysis', '')[:120]}")
+        print(f"  [Planner] sub_questions={len(sub_questions)}")
+        print(f"  [Planner] analysis: {parsed['query_analysis'][:120]}")
     return parsed
 
 async def rerank_accepted(
@@ -111,13 +149,23 @@ async def rerank_accepted(
                 max_tokens=_limits.rerank_max_tokens,
             )
             tracker.record(response.usage)
-            parsed = json.loads(response.content)
+            try:
+                parsed = json.loads(response.content)
+            except json.JSONDecodeError as exc:
+                logger.warning(
+                    "rerank.parse_error",
+                    error=str(exc)[:120],
+                    preview=response.content[:160],
+                )
+                reordered.extend(group)
+                continue
             if isinstance(parsed, dict):
                 for v in parsed.values():
                     if isinstance(v, list):
                         parsed = v
                         break
             if not isinstance(parsed, list):
+                logger.warning("rerank.unexpected_shape", got=type(parsed).__name__)
                 reordered.extend(group)
                 continue
             valid = set(group)
@@ -128,7 +176,10 @@ async def rerank_accepted(
                     group_order.append(d)
             reordered.extend(group_order)
             n_tiebreaks += 1
-        except Exception:
+        except Exception as exc:
+            # LLM call failure (network/timeout). Already retried by tenacity;
+            # keep order so the caller still gets results.
+            logger.warning("rerank.llm_failure", error=str(exc)[:200])
             reordered.extend(group)
 
     if not quiet:
@@ -347,12 +398,13 @@ async def run_retrieval(
                         max_tokens=limits.replan_max_tokens,
                     )
                     tracker.record(replan_resp.usage)
-                    parsed_replan = json.loads(replan_resp.content)
-                    revised = parsed_replan.get("revised_sub_questions", [])
-                    if isinstance(revised, list) and revised:
-                        revised = [sq for sq in revised if isinstance(sq, dict)]
+                    raw_replan = tools.parse_json_object(replan_resp.content)
+                    validated_replan = validate_replan(raw_replan)
+                    revised = [sq.model_dump() for sq in validated_replan.revised_sub_questions]
+                    parsed_replan = validated_replan.model_dump()
+                    if revised:
                         expected_count = len(remaining_sqs) - i
-                        if revised and len(revised) >= expected_count and (completed_count + len(revised)) <= max_subquestions:
+                        if len(revised) >= expected_count and (completed_count + len(revised)) <= max_subquestions:
                             n_spawned = len(revised) - expected_count
                             for sq in revised[expected_count:]:
                                 sq["spawned"] = True
@@ -362,11 +414,19 @@ async def run_retrieval(
                                 reasoning = parsed_replan.get("reasoning", "")[:100]
                                 spawn_note = f" (+{n_spawned} spawned)" if n_spawned else ""
                                 print(f"  [Replan] Updated {len(revised)} sub-Qs{spawn_note}: {reasoning}")
-                        elif not quiet:
-                            print(f"  [Replan] Rejected: got {len(revised)} sub-Qs, expected >={expected_count}, cap={max_subquestions - completed_count}")
-                except Exception:
+                        else:
+                            logger.warning(
+                                "replan.rejected",
+                                got=len(revised),
+                                expected_min=expected_count,
+                                cap=max_subquestions - completed_count,
+                            )
+                            if not quiet:
+                                print(f"  [Replan] Rejected: got {len(revised)} sub-Qs, expected >={expected_count}, cap={max_subquestions - completed_count}")
+                except (LLMParseError, LLMSchemaError) as exc:
+                    logger.warning("replan.invalid_response", error=str(exc)[:200])
                     if not quiet:
-                        print(f"  [Replan] parse error, keeping original plan")
+                        print(f"  [Replan] schema/parse error: {str(exc)[:120]}; keeping original plan")
 
                 # PAUSE 2: human reviews briefing + re-planner's revision
                 review_data = await review_callback("replan", {
@@ -423,10 +483,38 @@ async def run_retrieval(
                 if a.reason:
                     doc_reasons[a.doc_id].append(a.reason)
 
-        final_ids = await rerank_accepted(
-            entry.question, final_ids, metadata_index,
-            doc_counts, doc_reasons, tracker, quiet, limits=limits,
-        )
+        # Prefer the cross-encoder when it's available: same-or-better
+        # quality on fact-grounded reranking at ~1/50 the cost of an LLM
+        # call. Tie-breaks inside count-groups by relevance score; fall
+        # back to the LLM rerank for narrative-dependent edge cases.
+        ce_reordered: list[str] | None = None
+        if cross_encoder_available():
+            ce_snippets = {
+                doc_id: " | ".join(
+                    r for r in doc_reasons.get(doc_id, []) if r
+                ) or (metadata_index.get(doc_id).date if metadata_index.get(doc_id) else "")
+                for doc_id in final_ids
+            }
+            ce_reordered = rerank_with_cross_encoder(
+                entry.question, final_ids, ce_snippets,
+            )
+
+        if ce_reordered is not None:
+            # Preserve cross-sub-Q confirmation count as the primary key:
+            # cross-encoder breaks ties inside count-groups.
+            groups: dict[int, list[str]] = defaultdict(list)
+            for doc_id in ce_reordered:
+                groups[doc_counts.get(doc_id, 1)].append(doc_id)
+            final_ids = []
+            for count in sorted(groups.keys(), reverse=True):
+                final_ids.extend(groups[count])
+            if not quiet:
+                print(f"    [Rerank] cross-encoder on {len(final_ids)} candidates")
+        else:
+            final_ids = await rerank_accepted(
+                entry.question, final_ids, metadata_index,
+                doc_counts, doc_reasons, tracker, quiet, limits=limits,
+            )
 
     if skip_narrative:
         narrative = ""
