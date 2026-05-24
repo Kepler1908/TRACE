@@ -217,6 +217,18 @@ TRACE/
     logging.py      # Structured logging
 ```
 
+## Citation
+
+```bibtex
+@unpublished{bian:hal-05630930,
+  TITLE = {{TRACE: Accountable Agentic Retrieval for Source Discovery in Digital Archives}},
+  AUTHOR = {Bian, Donghan and Puren, Marie and Cafiero, Florian},
+  URL = {https://hal.science/hal-05630930},
+  NOTE = {working paper or preprint},
+  YEAR = {2026},
+}
+```
+
 ## License
 
 MIT
