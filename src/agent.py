@@ -8,11 +8,17 @@ from typing import Any
 
 from ..util.llm_client import LLMClient, TokenTracker
 from ..util.config import get_settings
+from ..util.logging import get_logger
 
-from .types import RetrievalState, AcceptedDoc
+from .types import (
+    RetrievalState, AcceptedDoc, LLMParseError,
+    HELD_REEVAL_SECOND_PASS_THRESHOLD,
+)
 from . import types as types_mod
 from . import prompts
 from . import tools
+
+logger = get_logger(__name__)
 
 
 
@@ -53,9 +59,15 @@ def init_stage_memory(
         mem["next_steps"] = "1. Review Phase 1 candidates"
     return mem
 
-def apply_memory_delta(current: dict[str, str] | str, delta: Any) -> dict[str, str] | str:
+def apply_memory_delta(current: dict[str, str], delta: Any) -> dict[str, str]:
+    """Apply a partial update to structured stage memory.
+
+    The agent prompt asks for a JSON object with the changed sections only.
+    Anything else (string, list, None) is rejected with a debug log so it
+    surfaces during evaluation instead of silently flipping the type.
+    """
+    base = current if isinstance(current, dict) else {}
     if isinstance(delta, dict) and delta:
-        base = current if isinstance(current, dict) else {}
         updated = dict(base)
         for k, v in delta.items():
             if v is None:
@@ -63,9 +75,16 @@ def apply_memory_delta(current: dict[str, str] | str, delta: Any) -> dict[str, s
             else:
                 updated[k] = str(v)
         return updated
-    if isinstance(delta, str) and delta.strip():
-        return delta.strip()
-    return current
+    if delta:
+        # Old-format string memory or malformed payload: keep the structured
+        # dict and emit a warning so it's visible in logs.
+        from ..util.logging import get_logger
+        get_logger(__name__).warning(
+            "memory_update.unexpected_type",
+            type=type(delta).__name__,
+            preview=str(delta)[:120],
+        )
+    return base
 
 _MEMORY_SECTION_ORDER = [
     ("prior_findings", "Prior Findings"),
@@ -75,9 +94,7 @@ _MEMORY_SECTION_ORDER = [
     ("next_steps", "Next Steps"),
 ]
 
-def format_structured_memory(mem: dict[str, str] | str) -> str:
-    if isinstance(mem, str):
-        return tools.truncate_stage_memory(mem.strip()) if mem.strip() else "(empty)"
+def format_structured_memory(mem: dict[str, str]) -> str:
     if not mem:
         return "(empty)"
     parts: list[str] = []
@@ -95,7 +112,7 @@ def format_state_for_llm(
     query: str,
     state: RetrievalState,
     step_n: int,
-    stage_memory: dict[str, str] | str,
+    stage_memory: dict[str, str],
     action_log: list[str],
     metadata_index: dict[str, types_mod.MetadataEntry] | None = None,
     tool_output: str | None = None,
@@ -327,30 +344,44 @@ async def run_held_reevaluation(
             max_tokens=_limits.held_reeval_max_tokens,
         )
         tracker.record(response.usage)
+    except Exception as exc:
+        logger.warning("held_reeval.llm_failure", error=str(exc)[:200])
+        if not quiet:
+            print(f"    [Held Re-eval] LLM failure: {str(exc)[:120]}; no promotions")
+        return []
+
+    try:
         parsed = json.loads(response.content)
-        if isinstance(parsed, dict):
-            for v in parsed.values():
-                if isinstance(v, list):
-                    parsed = v
-                    break
-        if not isinstance(parsed, list):
-            return []
-        # Map parent doc_ids → chunk_keys in state.held
-        # LLM returns parent doc_ids; state.held stores chunk_keys
-        parent_to_held_ck: dict[str, str] = {}
-        for ck in state.held:
-            doc = chunked_docs.get(ck)
-            pid = doc.doc_id if doc else ck
-            parent_to_held_ck[pid] = ck
-            parent_to_held_ck[ck] = ck  # also match if LLM returns chunk_key
-        promoted = [parent_to_held_ck[d] for d in parsed if d in parent_to_held_ck]
-        if not quiet and promoted:
-            print(f"    [Held Re-eval] Promoted {len(promoted)}: {promoted}")
-        return promoted
-    except Exception:
+    except json.JSONDecodeError as exc:
+        logger.warning(
+            "held_reeval.parse_error",
+            error=str(exc)[:120],
+            preview=response.content[:160],
+        )
         if not quiet:
             print("    [Held Re-eval] parse error; no promotions")
         return []
+
+    if isinstance(parsed, dict):
+        for v in parsed.values():
+            if isinstance(v, list):
+                parsed = v
+                break
+    if not isinstance(parsed, list):
+        logger.warning("held_reeval.unexpected_shape", got=type(parsed).__name__)
+        return []
+    # Map parent doc_ids → chunk_keys in state.held.
+    # LLM returns parent doc_ids; state.held stores chunk_keys.
+    parent_to_held_ck: dict[str, str] = {}
+    for ck in state.held:
+        doc = chunked_docs.get(ck)
+        pid = doc.doc_id if doc else ck
+        parent_to_held_ck[pid] = ck
+        parent_to_held_ck[ck] = ck  # also match if LLM returns chunk_key
+    promoted = [parent_to_held_ck[d] for d in parsed if d in parent_to_held_ck]
+    if not quiet and promoted:
+        print(f"    [Held Re-eval] Promoted {len(promoted)}: {promoted}")
+    return promoted
 
 async def run_phase2(
     query: str,
@@ -374,7 +405,7 @@ async def run_phase2(
     consecutive_empty_searches = 0
     parse_error_count = 0
 
-    stage_memory: dict[str, str] | str = initial_stage_memory
+    stage_memory: dict[str, str] = dict(initial_stage_memory)
     action_log: list[str] = []
     pending_tool_output: str | None = None
 
@@ -384,6 +415,7 @@ async def run_phase2(
     async def _do_finish(
         step_label: int | None = None,
     ) -> tuple[list[str], list[str], dict[str, Any], list[dict[str, Any]], list[AcceptedDoc]]:
+        accepted_before = len(state.accepted)
         promoted = await run_held_reevaluation(
                 query, state, chunked_docs, metadata_index, tracker, quiet,
                 limits=limits,
@@ -407,6 +439,41 @@ async def run_phase2(
                 "observation": obs,
             })
             action_log.append(f"[Re-eval] {obs}")
+
+            # Second pass: if the accepted set moved significantly, re-judge
+            # any remaining held docs against the now-richer evidence. Cheap
+            # extra call when the first promotion already shifted the picture.
+            delta = len(state.accepted) - accepted_before
+            denom = max(accepted_before, 1)
+            if (
+                state.held
+                and accepted_before > 0
+                and (delta / denom) > HELD_REEVAL_SECOND_PASS_THRESHOLD
+            ):
+                promoted2 = await run_held_reevaluation(
+                    query, state, chunked_docs, metadata_index, tracker, quiet,
+                    limits=limits,
+                )
+                if promoted2:
+                    for chunk_key in promoted2:
+                        doc = chunked_docs.get(chunk_key)
+                        parent = doc.doc_id if doc else chunk_key
+                        if not any(a.doc_id == parent for a in state.accepted):
+                            state.accepted.append(
+                                AcceptedDoc(parent, "promoted_from_hold_pass2",
+                                            step_label or state.step_count,
+                                            chunk_key=chunk_key)
+                            )
+                    state.held = [h for h in state.held if h not in set(promoted2)]
+                    obs2 = f"held_reeval_pass2 -> {len(promoted2)} promoted (total accepted: {len(state.accepted)})"
+                    steps.append({
+                        "phase": 2, "step": step_label or state.step_count,
+                        "thought": "second held reevaluation",
+                        "action": "held_reeval_pass2",
+                        "args": {"promoted": promoted2},
+                        "observation": obs2,
+                    })
+                    action_log.append(f"[Re-eval-2] {obs2}")
 
         accepted_ids = [a.doc_id for a in state.accepted]
         held_ids = list(state.held)
@@ -445,12 +512,25 @@ async def run_phase2(
                 max_tokens=limits.briefing_max_tokens,
             )
             tracker.record(resp.usage)
-            parsed_b = json.loads(resp.content)
-            if isinstance(parsed_b, dict):
-                briefing = parsed_b
-        except Exception:
+        except Exception as exc:
+            logger.warning("briefing.llm_failure", error=str(exc)[:200])
             if not quiet:
-                print("    [Briefing] parse error; empty briefing")
+                print(f"    [Briefing] LLM failure: {str(exc)[:120]}; empty briefing")
+        else:
+            try:
+                parsed_b = json.loads(resp.content)
+                if isinstance(parsed_b, dict):
+                    briefing = parsed_b
+                else:
+                    logger.warning("briefing.unexpected_shape", got=type(parsed_b).__name__)
+            except json.JSONDecodeError as exc:
+                logger.warning(
+                    "briefing.parse_error",
+                    error=str(exc)[:120],
+                    preview=resp.content[:160],
+                )
+                if not quiet:
+                    print("    [Briefing] parse error; empty briefing")
 
         if not quiet and briefing:
             summary = briefing.get("summary", "")[:100]
@@ -940,8 +1020,10 @@ async def run_phase2(
                                 ck = h.chunk_key or h.doc_id
                                 state.held.append(ck)
                                 held_parents_for_exp.add(h.doc_id)
-                    except (ValueError, Exception):
-                        pass
+                    except ValueError as exc:
+                        # Malformed date arithmetic — skip expansion silently
+                        # is fine because base hits are unaffected.
+                        logger.debug("date_expansion.bad_date", error=str(exc)[:120])
 
                 filter_note = f" [{corpus_filter}]" if corpus_filter else ""
                 obs_prefix += f"{filter_note})"

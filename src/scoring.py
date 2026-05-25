@@ -4,12 +4,13 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from collections import defaultdict
 from typing import Any
 
 from .types import (
     CorpusDoc, MetadataEntry, SearchHit, FusedCandidate,
-    PER_CHANNEL_MAX, RRF_K,
+    PER_CHANNEL_MAX, RRF_K, LLMParseError,
 )
 from .search.bm25 import BM25Index, tool_bm25
 from .search.cosine import EmbeddingIndex, tool_cosine
@@ -17,6 +18,19 @@ from .search.date import search_date
 
 
 _DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+_WHITESPACE_RE = re.compile(r"\s+")
+
+
+def _normalize_query(text: str) -> str:
+    """Unicode-NFKC + whitespace collapse + lowercase.
+
+    Used to dedupe agent searches that only differ in punctuation, accents
+    or whitespace — the prior strict-lower compare let near-duplicates slip.
+    """
+    if not text:
+        return ""
+    normalized = unicodedata.normalize("NFKC", text).casefold()
+    return _WHITESPACE_RE.sub(" ", normalized).strip()
 
 
 # ---------------------------------------------------------------------------
@@ -70,7 +84,12 @@ def run_score_fusion(
     scores: dict[str, float] = defaultdict(float)
     channels_map: dict[str, list[str]] = defaultdict(list)
     snippets: dict[str, str] = {}
-    chunk_keys: dict[str, str] = {}  # best chunk_key per parent doc_id
+    # Best chunk_key per parent doc_id, picked by RRF-rank (cross-channel
+    # comparable) with dense > bm25 > metadata as tie-breaker since dense
+    # spans contain the semantically relevant excerpt for review.
+    chunk_keys: dict[str, str] = {}
+    chunk_key_rank: dict[str, float] = {}
+    _CHANNEL_PRIORITY = {"dense": 0, "bm25": 1, "metadata": 2}
 
     for ch_name, hits in channel_hits.items():
         if not hits:
@@ -87,10 +106,14 @@ def run_score_fusion(
             channels_map[h.doc_id].append(ch_name)
             if h.doc_id not in snippets:
                 snippets[h.doc_id] = h.snippet
-            # Track best chunk_key (from highest-scoring channel hit)
-            if h.chunk_key and (h.doc_id not in chunk_keys
-                                or h.score > seen.get(h.doc_id, h).score):
-                chunk_keys[h.doc_id] = h.chunk_key
+            if h.chunk_key:
+                ch_prio = _CHANNEL_PRIORITY.get(ch_name, 9)
+                # Prefer best RRF rank; ties broken by channel priority.
+                key_score = -rank * 10 - ch_prio
+                if (h.doc_id not in chunk_keys
+                        or key_score > chunk_key_rank[h.doc_id]):
+                    chunk_keys[h.doc_id] = h.chunk_key
+                    chunk_key_rank[h.doc_id] = key_score
 
     # Sort by RRF score
     sorted_all = sorted(scores.keys(), key=lambda d: (-scores[d], d))
@@ -158,27 +181,40 @@ def is_repeated_query(
     corpus_filter: str | None = None,
     action_key: str = "",
 ) -> bool:
-    """Check if a query was already made (avoid repeated searches)."""
-    query_norm = query.strip().lower()
+    """Check if a query was already made (avoid repeated searches).
+
+    Comparison uses NFKC-normalized casefolded text with whitespace collapse,
+    so trivial paraphrases ("Hugo, Victor" vs "  hugo victor  ") are caught.
+    """
+    query_norm = _normalize_query(query)
     for prev_action, prev_query, prev_filter in call_history:
         if action_key and prev_action != action_key:
             continue
-        if prev_query.strip().lower() == query_norm:
+        if _normalize_query(prev_query) == query_norm:
             if corpus_filter == prev_filter or (not corpus_filter and not prev_filter):
                 return True
     return False
 
 
 def parse_json_object(text: str) -> dict[str, Any]:
-    """Parse a JSON object from LLM response, stripping fences."""
+    """Parse a JSON object from LLM response, stripping fences.
+
+    Raises ``LLMParseError`` (a typed exception) on failure so callers can
+    distinguish parse problems from genuine LLM/network errors.
+    """
     import json
-    text = text.strip()
-    # Strip markdown code fences
-    if text.startswith("```"):
-        lines = text.split("\n")
+    raw = (text or "").strip()
+    stripped = raw
+    if stripped.startswith("```"):
+        lines = stripped.split("\n")
         lines = [l for l in lines if not l.strip().startswith("```")]
-        text = "\n".join(lines).strip()
-    return json.loads(text)
+        stripped = "\n".join(lines).strip()
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError as exc:
+        raise LLMParseError(
+            f"could not parse JSON object: {exc.msg} (preview: {raw[:160]!r})"
+        ) from exc
 
 
 def truncate_stage_memory(text: str, max_chars: int = 1500) -> str:

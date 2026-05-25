@@ -23,13 +23,14 @@ from pathlib import Path
 
 import numpy as np
 
-from ..src.types import CORPUS_DIR, CHUNK_MAX_TOKENS
+from ..src.types import CORPUS_DIR, CHUNK_MAX_TOKENS, EMBEDDING_BATCH_SIZE
 from ..src.data import build_full_corpus, build_chunked_corpus
 from .config import get_settings
 
 DEFAULT_CACHE_DIR = CORPUS_DIR
 
 CHECKPOINT_INTERVAL = 500
+DEFAULT_BATCH_SIZE = EMBEDDING_BATCH_SIZE
 
 
 def _save_checkpoint(
@@ -93,6 +94,10 @@ def main() -> None:
         "--resume", action="store_true",
         help="Resume from last checkpoint (after OOM or interruption)",
     )
+    parser.add_argument(
+        "--batch-size", type=int, default=DEFAULT_BATCH_SIZE,
+        help=f"Encoder batch size (default: {DEFAULT_BATCH_SIZE}). Lower it if you hit OOM.",
+    )
     args = parser.parse_args()
 
     t0 = time.monotonic()
@@ -154,34 +159,43 @@ def main() -> None:
     import torch
 
     remaining = n_chunks - start_idx
-    print(f"Encoding {remaining} chunks (batch_size=1, checkpoint every {CHECKPOINT_INTERVAL})...")
+    batch_size = max(1, int(args.batch_size))
+    print(f"Encoding {remaining} chunks (batch_size={batch_size}, checkpoint every {CHECKPOINT_INTERVAL})...")
 
     encoded = start_idx
     last_checkpoint = start_idx
+    last_progress_report = start_idx
 
-    for i in range(start_idx, n_chunks):
-        text = chunk_texts[i]
+    i = start_idx
+    while i < n_chunks:
+        batch_end = min(i + batch_size, n_chunks)
+        batch_texts = chunk_texts[i:batch_end]
 
         with torch.no_grad():
             emb = model.encode(
-                [text],
+                batch_texts,
                 normalize_embeddings=True,
                 show_progress_bar=False,
-                batch_size=1,
+                batch_size=batch_size,
             )
-        all_embeddings[i] = np.asarray(emb[0], dtype=np.float32)
-        encoded += 1
+        emb_arr = np.asarray(emb, dtype=np.float32)
+        all_embeddings[i:batch_end] = emb_arr
+        batch_count = batch_end - i
+        encoded += batch_count
+        i = batch_end
 
-        if encoded % 50 == 0:
-            del emb
+        if encoded % (batch_size * 4) < batch_size:
+            del emb, emb_arr
             gc.collect()
-            torch.cuda.empty_cache()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
-        if encoded % 200 == 0 or encoded == n_chunks:
+        if encoded - last_progress_report >= 200 or encoded == n_chunks:
             elapsed = time.monotonic() - t0
             rate = encoded / elapsed if elapsed > 0 else 0
             eta = (n_chunks - encoded) / rate if rate > 0 else 0
             print(f"  {encoded}/{n_chunks} ({rate:.1f} chunks/s, ETA {eta:.0f}s)")
+            last_progress_report = encoded
 
         if encoded - last_checkpoint >= CHECKPOINT_INTERVAL:
             _save_checkpoint(all_embeddings, chunk_doc_ids, encoded, args.out_dir)

@@ -10,6 +10,27 @@ from typing import Any
 from .search.bm25 import BM25Index
 from .search.cosine import EmbeddingIndex
 
+
+# ---------------------------------------------------------------------------
+# Typed exceptions — replace bare `except Exception` so silent failures
+# surface as warnings instead of masquerading as empty results.
+# ---------------------------------------------------------------------------
+
+class PipelineError(Exception):
+    """Base class for TRACE pipeline errors."""
+
+
+class LLMParseError(PipelineError, ValueError):
+    """LLM returned content that could not be parsed as the expected JSON shape.
+
+    Also inherits from ``ValueError`` so legacy ``except ValueError`` blocks
+    continue to work unchanged.
+    """
+
+
+class LLMSchemaError(PipelineError, ValueError):
+    """LLM output parsed as JSON but failed schema validation."""
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -27,6 +48,17 @@ DEFAULT_LIMIT = 5
 
 # Chunking
 CHUNK_MAX_TOKENS = 1000            # sentence-boundary chunks for BM25/embeddings
+CHUNK_OVERLAP_RATIO = 0.12         # 10–15% overlap between consecutive chunks
+EMBEDDING_BATCH_SIZE = 64          # build_embeddings batch (1 → 64 is the unlock)
+
+# Feature flags (toggle implementations introduced in the 2026-05 review)
+USE_BM25S = True                   # use bm25s lib if available, fall back to inverted-list custom impl
+USE_ANN_INDEX = True               # use usearch/faiss HNSW if available, fall back to numpy brute force
+USE_CROSS_ENCODER_RERANK = True    # use cross-encoder reranker if available, fall back to LLM rerank
+USE_ANTHROPIC_PROMPT_CACHING = True
+HELD_REEVAL_SECOND_PASS_THRESHOLD = 0.5  # retrigger held re-eval if |accepted| moved by > 50%
+PLANNER_VALIDATION_RETRIES = 2
+CROSS_ENCODER_MODEL = "BAAI/bge-reranker-v2-m3"
 
 # Per-call max_tokens caps (avoids wasting decode budget)
 AGENT_SEARCH_MAX_TOKENS = 768
